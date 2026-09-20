@@ -52,6 +52,7 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+	testHooks   clientTestHooks
 }
 
 // ClientOpts configures a client
@@ -256,16 +257,20 @@ func (cs *clientStream) RecvMsg(m any) error {
 
 	var msg *streamMessage
 	select {
-	case <-cs.ctx.Done():
-		return cs.ctx.Err()
-	case <-cs.s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-cs.s.recv:
-		default:
-			return cs.s.recvErr
-		}
 	case msg = <-cs.s.recv:
+	default:
+		select {
+		case <-cs.ctx.Done():
+			return cs.ctx.Err()
+		case <-cs.s.recvClose:
+			// If recv has a pending message, process that first
+			select {
+			case msg = <-cs.s.recv:
+			default:
+				return cs.s.recvErr
+			}
+		case msg = <-cs.s.recv:
+		}
 	}
 
 	switch msg.header.Type {
@@ -369,6 +374,9 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				if c.testHooks != nil {
+					c.testHooks.streamInactive(uint32(sid), msg.header)
+				}
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
@@ -378,6 +386,8 @@ func (c *Client) receiveLoop() error {
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+				} else if c.testHooks != nil {
+					c.testHooks.streamDelivered(uint32(sid), msg.header)
 				}
 			}
 		}
@@ -544,18 +554,22 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 
 	var msg *streamMessage
 	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.ctx.Done():
-		return ErrClosed
-	case <-s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-s.recv:
-		default:
-			return s.recvErr
-		}
 	case msg = <-s.recv:
+	default:
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.ctx.Done():
+			return ErrClosed
+		case <-s.recvClose:
+			// If recv has a pending message, process that first
+			select {
+			case msg = <-s.recv:
+			default:
+				return s.recvErr
+			}
+		case msg = <-s.recv:
+		}
 	}
 
 	if msg.header.Type == messageTypeResponse {

@@ -41,6 +41,8 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+	testHooks   serverTestHooks
+	testWake    chan struct{}
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -60,6 +62,7 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 		done:        make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
+		testWake:    make(chan struct{}, 1),
 	}, nil
 }
 
@@ -158,6 +161,9 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if s.testHooks != nil {
+			s.testHooks.shutdownLoop()
+		}
 		s.closeIdleConns()
 
 		if s.countConnection() == 0 {
@@ -168,6 +174,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+		case <-s.testWake:
 		}
 	}
 
@@ -289,6 +296,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		runDone:   make(chan struct{}),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -303,9 +311,12 @@ type serverConn struct {
 	conn      net.Conn
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
+	streams   sync.Map
+	active    atomic.Int32
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+	runDone      chan struct{}
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -337,20 +348,31 @@ func (c *serverConn) run(sctx context.Context) {
 	)
 
 	var (
-		ch                     = newChannel(c.conn)
-		ctx, cancel            = context.WithCancel(sctx)
-		state        connState = connStateIdle
-		responses              = make(chan response)
-		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		ch                            = newChannel(c.conn)
+		ctx, cancel                   = context.WithCancel(sctx)
+		state               connState = connStateIdle
+		responses                     = make(chan response)
+		recvErr                       = make(chan error, 1)
+		done                          = make(chan struct{})
+		lastStreamID        uint32
+		notifyStateChanged  = func(connState) {}
+		notifyStreamClosing = func(uint32) {}
+		notifyHalfClosed    = func(uint32) {}
+		notifyDataRejected  = func(uint32) {}
+		notifyStreamClosed  = func(uint32) {}
 	)
+	if hooks := c.server.testHooks; hooks != nil {
+		notifyStateChanged = hooks.connStateChanged
+		notifyStreamClosing = hooks.streamClosing
+		notifyHalfClosed = hooks.streamHalfClosed
+		notifyDataRejected = hooks.streamDataRejected
+		notifyStreamClosed = hooks.streamClosed
+	}
 
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
+	defer close(c.runDone)
 	defer c.server.delConnection(c)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
@@ -408,8 +430,9 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			if mh.Type == messageTypeData {
-				i, ok := streams.Load(mh.StreamID)
+				i, ok := c.streams.Load(mh.StreamID)
 				if !ok {
+					notifyDataRejected(mh.StreamID)
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
 					}
@@ -433,6 +456,7 @@ func (c *serverConn) run(sctx context.Context) {
 
 				if mh.Flags&flagRemoteClosed == flagRemoteClosed {
 					sh.closeSend()
+					notifyHalfClosed(mh.StreamID)
 					if len(p) > 0 {
 						if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "data close message cannot include data")) {
 							return
@@ -487,8 +511,8 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 
-				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				c.streams.Store(id, sh)
+				c.active.Add(1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -500,7 +524,7 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
-		activeN := atomic.LoadInt32(&active)
+		activeN := c.active.Load()
 		if activeN > 0 {
 			newstate = connStateActive
 			shutdown = nil
@@ -511,10 +535,14 @@ func (c *serverConn) run(sctx context.Context) {
 		if newstate != state {
 			c.setState(newstate)
 			state = newstate
+			notifyStateChanged(state)
 		}
 
 		select {
 		case response := <-responses:
+			if response.closeStream {
+				notifyStreamClosing(response.id)
+			}
 			if !response.streaming || response.status.Code() != codes.OK {
 				p, err := c.server.codec.Marshal(&Response{
 					Status:  response.status.Proto(),
@@ -547,8 +575,10 @@ func (c *serverConn) run(sctx context.Context) {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
-				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				if _, ok := c.streams.LoadAndDelete(response.id); ok {
+					c.active.Add(-1)
+					notifyStreamClosed(response.id)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
