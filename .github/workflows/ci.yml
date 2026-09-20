@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  #
+  # golangci-lint
+  #
+  linters:
+    name: Linters
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src/github.com/containerd/ttrpc
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          version: v2.7.2
+          args: --timeout=5m
+          skip-cache: true
+          working-directory: src/github.com/containerd/ttrpc
+
+  #
+  # Project checks
+  #
+  project:
+    name: Project Checks
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: src/github.com/containerd/ttrpc
+          fetch-depth: 25
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: 'stable'
+
+      - uses: containerd/project-checks@d7751f3c375b8fe4a84c02a068184ee4c1f59bc4 # v1.2.2
+        with:
+          working-directory: src/github.com/containerd/ttrpc
+
+  #
+  # Build and Test project
+  #
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: [oldstable, stable]
+
+    name: ${{ matrix.os }} / ${{ matrix.go }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        path: src/github.com/containerd/ttrpc
+        fetch-depth: 25
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: ${{ matrix.go }}
+
+    - name: Test
+      working-directory: src/github.com/containerd/ttrpc
+      run: |
+        make test
+
+    - name: Coverage
+      working-directory: src/github.com/containerd/ttrpc
+      run: |
+        make coverage TESTFLAGS_RACE=-race
+
+    - name: Integration Tests
+      working-directory: src/github.com/containerd/ttrpc
+      run: |
+        make integration
+
+  #
+  # Run Buf
+  #
+  buf:
+    name: Run Buf
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        path: src/github.com/containerd/ttrpc
+        fetch-depth: 25
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version: 'stable'
+      id: go
+
+    - name: Read buf version
+      id: buf-version
+      working-directory: src/github.com/containerd/ttrpc
+      run: echo "version=$(cat script/buf-version)" >> $GITHUB_OUTPUT
+
+    - name: Install buf
+      uses: bufbuild/buf-action@v1
+      with:
+        setup_only: true
+        version: ${{ steps.buf-version.outputs.version }}
+
+    - name: Install protoc-gen-go-ttrpc
+      working-directory: src/github.com/containerd/ttrpc
+      run: |
+        make install
+
+    - name: Check protos
+      working-directory: src/github.com/containerd/ttrpc
+      run: |
+        make check-protos
