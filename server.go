@@ -304,6 +304,12 @@ type serverConn struct {
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
 
+	// streams holds the active stream handlers for this connection, keyed by
+	// stream id. active counts the entries. Both are mutated from run and its
+	// receive goroutine; active must be accessed atomically.
+	streams sync.Map
+	active  int32
+
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
 }
@@ -343,8 +349,6 @@ func (c *serverConn) run(sctx context.Context) {
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
 		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
 		lastStreamID uint32
 	)
 
@@ -408,7 +412,7 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			if mh.Type == messageTypeData {
-				i, ok := streams.Load(mh.StreamID)
+				i, ok := c.streams.Load(mh.StreamID)
 				if !ok {
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
@@ -487,8 +491,8 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 
-				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+			c.streams.Store(id, sh)
+			atomic.AddInt32(&c.active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -500,7 +504,7 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
-		activeN := atomic.LoadInt32(&active)
+		activeN := atomic.LoadInt32(&c.active)
 		if activeN > 0 {
 			newstate = connStateActive
 			shutdown = nil
@@ -547,8 +551,8 @@ func (c *serverConn) run(sctx context.Context) {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
-				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+			c.streams.Delete(response.id)
+			atomic.AddInt32(&c.active, -1)
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
