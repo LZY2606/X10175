@@ -136,7 +136,12 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 }
 
 func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
-	c.sendLock.Lock()
+	if !c.sendLock.TryLock() {
+		if h := streamHooks.channelSendBlocked; h != nil {
+			h()
+		}
+		c.sendLock.Lock()
+	}
 	defer c.sendLock.Unlock()
 	return c.channel.send(sid, mt, flags, b)
 }
@@ -425,6 +430,9 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	}(); err != nil {
 		return nil, err
 	}
+	if h := streamHooks.clientStreamRegistered; h != nil {
+		h(s.id)
+	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
 		return s, filterCloseErr(err)
@@ -438,6 +446,9 @@ func (c *Client) deleteStream(s *stream) {
 	delete(c.streams, s.id)
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
+	if h := streamHooks.clientStreamDeleted; h != nil {
+		h(s.id)
+	}
 }
 
 func (c *Client) getStream(sid streamID) *stream {

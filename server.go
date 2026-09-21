@@ -352,6 +352,11 @@ func (c *serverConn) run(sctx context.Context) {
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer func() {
+		if h := streamHooks.serverConnExited; h != nil {
+			h()
+		}
+	}()
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -487,7 +492,13 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 
+				if sh != nil {
+					sh.id = id
+				}
 				streams.Store(id, sh)
+				if h := streamHooks.serverStreamTable; h != nil {
+					h(&streams)
+				}
 				atomic.AddInt32(&active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
@@ -549,6 +560,9 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				if h := streamHooks.serverStreamDeleted; h != nil {
+					h(response.id, &streams)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

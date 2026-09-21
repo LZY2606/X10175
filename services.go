@@ -174,6 +174,7 @@ type streamHandler struct {
 	respond func(*status.Status, []byte, bool, bool) error
 	recv    chan Unmarshaler
 	info    *StreamServerInfo
+	id      uint32
 
 	remoteClosed bool
 	localClosed  bool
@@ -196,6 +197,9 @@ func (s *streamHandler) data(unmarshal Unmarshaler) error {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	default:
+		if h := streamHooks.serverDataBlocked; h != nil {
+			h(s.id)
+		}
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise return an error.
 		select {

@@ -83,6 +83,9 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+		if h := streamHooks.clientReceiveBlocked; h != nil {
+			h(s.id)
+		}
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise close the stream.
 		select {
