@@ -52,6 +52,26 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	// testHooks holds optional, package-private instrumentation used by
+	// the state-machine tests. It is nil outside of tests and every use
+	// site must be safe to call with a nil receiver; production behavior
+	// is unchanged when it is not set.
+	testHooks *clientTestHooks
+}
+
+// clientTestHooks contains package-private test-only hooks. All fields are
+// optional. Hooks must never block: channels used here are buffered and
+// sends are non-blocking.
+type clientTestHooks struct {
+	// sendHook, if non-nil, is invoked while holding sendLock and before
+	// a frame is written to the connection. Returning an error makes the
+	// send fail with that error without touching the wire.
+	sendHook func(streamID uint32, t messageType, flags uint8) error
+	// recvBlocked is signaled (non-blocking send) with a stream id when
+	// the receive loop enters the backpressure slow path for that
+	// stream's recv channel.
+	recvBlocked chan streamID
 }
 
 // ClientOpts configures a client
@@ -138,6 +158,11 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 func (c *Client) send(sid uint32, mt messageType, flags uint8, b []byte) error {
 	c.sendLock.Lock()
 	defer c.sendLock.Unlock()
+	if c.testHooks != nil && c.testHooks.sendHook != nil {
+		if err := c.testHooks.sendHook(sid, mt, flags); err != nil {
+			return err
+		}
+	}
 	return c.channel.send(sid, mt, flags, b)
 }
 
@@ -418,6 +443,16 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		}
 
 		s = newStream(c.nextStreamID, c, recvBuf)
+		if c.testHooks != nil && c.testHooks.recvBlocked != nil {
+			id := s.id
+			ch := c.testHooks.recvBlocked
+			s.onRecvBlocked = func() {
+				select {
+				case ch <- id:
+				default:
+				}
+			}
+		}
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
 

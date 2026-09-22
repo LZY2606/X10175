@@ -177,6 +177,10 @@ type streamHandler struct {
 
 	remoteClosed bool
 	localClosed  bool
+
+	// onDataBlocked, if non-nil, is invoked at most once per data() call
+	// that enters the backpressure slow path. Test-only; must not block.
+	onDataBlocked func()
 }
 
 func (s *streamHandler) closeSend() {
@@ -196,6 +200,9 @@ func (s *streamHandler) data(unmarshal Unmarshaler) error {
 	case <-s.ctx.Done():
 		return s.ctx.Err()
 	default:
+		if s.onDataBlocked != nil {
+			s.onDataBlocked()
+		}
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise return an error.
 		select {

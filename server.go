@@ -43,6 +43,58 @@ type Server struct {
 	done        chan struct{}            // marks point at which we stop serving requests
 }
 
+// testEventKind identifies a lifecycle event observed by the state-machine
+// tests on the server side.
+type testEventKind int
+
+const (
+	testEventConnStarted testEventKind = iota
+	testEventStreamStarted
+	testEventStreamEnded
+	testEventDataBlocked
+	testEventConnDone
+)
+
+func (k testEventKind) String() string {
+	switch k {
+	case testEventConnStarted:
+		return "conn-started"
+	case testEventStreamStarted:
+		return "stream-started"
+	case testEventStreamEnded:
+		return "stream-ended"
+	case testEventDataBlocked:
+		return "data-blocked"
+	case testEventConnDone:
+		return "conn-done"
+	default:
+		return "unknown"
+	}
+}
+
+// serverTestEvent is a point-in-time lifecycle observation. All fields are
+// zero unless relevant for the event kind.
+type serverTestEvent struct {
+	kind testEventKind
+	conn *serverConn
+	id   uint32
+}
+
+// serverTestHooks contains package-private, test-only instrumentation.
+type serverTestHooks struct {
+	events chan serverTestEvent
+}
+
+func (s *Server) testEvent(ev serverTestEvent) {
+	if s.config == nil || s.config.testHooks == nil || s.config.testHooks.events == nil {
+		return
+	}
+	select {
+	case s.config.testHooks.events <- ev:
+	default:
+	}
+}
+
 func NewServer(opts ...ServerOpt) (*Server, error) {
 	config := &serverConfig{}
 	for _, opt := range opts {
@@ -306,6 +358,10 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// testStreamSnapshot, when set, returns the stream ids currently
+	// registered for the connection. Test-only.
+	testStreamSnapshot func() []uint32
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -352,6 +408,17 @@ func (c *serverConn) run(sctx context.Context) {
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer c.server.testEvent(serverTestEvent{kind: testEventConnDone, conn: c})
+
+	c.testStreamSnapshot = func() []uint32 {
+		var ids []uint32
+		streams.Range(func(key, _ any) bool {
+			ids = append(ids, key.(uint32))
+			return true
+		})
+		return ids
+	}
+	c.server.testEvent(serverTestEvent{kind: testEventConnStarted, conn: c})
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -489,6 +556,13 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				c.server.testEvent(serverTestEvent{kind: testEventStreamStarted, conn: c, id: id})
+				if sh != nil && c.server.config != nil && c.server.config.testHooks != nil {
+					sid := id
+					sh.onDataBlocked = func() {
+						c.server.testEvent(serverTestEvent{kind: testEventDataBlocked, conn: c, id: sid})
+					}
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +623,7 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				c.server.testEvent(serverTestEvent{kind: testEventStreamEnded, conn: c, id: response.id})
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

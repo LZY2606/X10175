@@ -24,6 +24,11 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+
+	// testHooks holds optional package-private instrumentation used by
+	// the state-machine tests. It is nil in production and every use
+	// site is a nil-safe test-only hook.
+	testHooks *serverTestHooks
 }
 
 // ServerOpt for configuring a ttrpc server

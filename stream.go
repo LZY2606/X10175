@@ -37,6 +37,11 @@ type stream struct {
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
+
+	// onRecvBlocked, if non-nil, is invoked at most once per receive()
+	// call that enters the backpressure slow path (recv buffer already
+	// full). Test-only; must not block.
+	onRecvBlocked func()
 }
 
 func newStream(id streamID, send sender, recvBuf int) *stream {
@@ -83,6 +88,9 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
+		if s.onRecvBlocked != nil {
+			s.onRecvBlocked()
+		}
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise close the stream.
 		select {
