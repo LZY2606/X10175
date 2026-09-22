@@ -289,6 +289,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		hooks:     s.config.hooks,
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +307,9 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	hooks   *serverHooks
+	streams sync.Map
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -343,15 +347,19 @@ func (c *serverConn) run(sctx context.Context) {
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
 		done                   = make(chan struct{})
-		streams                = sync.Map{}
 		active       int32
 		lastStreamID uint32
 	)
 
+	streams := &c.streams
+
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
+	defer c.hooks.finished(c)
 	defer c.server.delConnection(c)
+	c.hooks.started(c)
+	c.hooks.state(c, connStateIdle)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -373,6 +381,7 @@ func (c *serverConn) run(sctx context.Context) {
 
 	go func(recvErr chan error) {
 		defer close(recvErr)
+		defer c.hooks.recvLoopFinished()
 		for {
 			select {
 			case <-c.shutdown:
@@ -410,6 +419,7 @@ func (c *serverConn) run(sctx context.Context) {
 			if mh.Type == messageTypeData {
 				i, ok := streams.Load(mh.StreamID)
 				if !ok {
+					c.hooks.orphan(mh.StreamID, mh.Type)
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
 					}
@@ -465,6 +475,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 				id := mh.StreamID
 				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
+					if closeStream {
+						defer c.hooks.finishedHandler(id)
+					}
 					select {
 					case responses <- response{
 						id:          id,
@@ -478,7 +491,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 					return nil
 				}
-				sh, err := c.server.services.handle(ctx, &req, respond)
+				sh, err := c.server.services.handle(ctx, &req, respond, c.hooks, id)
 				if err != nil {
 					status, _ := status.FromError(err)
 					if !sendStatus(mh.StreamID, status) {
@@ -488,6 +501,7 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 
 				streams.Store(id, sh)
+				c.hooks.registered(id)
 				atomic.AddInt32(&active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
@@ -511,6 +525,7 @@ func (c *serverConn) run(sctx context.Context) {
 		if newstate != state {
 			c.setState(newstate)
 			state = newstate
+			c.hooks.state(c, newstate)
 		}
 
 		select {
@@ -548,12 +563,21 @@ func (c *serverConn) run(sctx context.Context) {
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
+				c.hooks.deleted(response.id)
 				atomic.AddInt32(&active, -1)
+			}
+			if response.closeStream {
+				c.hooks.finishedHandler(response.id)
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
 			// branch. Basically, it means that we are no longer receiving
 			// requests due to a terminal error.
+			if err == nil {
+				// The receive goroutine exited cleanly (e.g. forced
+				// shutdown) and merely closed the channel.
+				return
+			}
 			recvErr = nil // connection is now "closing"
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET) {
 				// The client went away and we should stop processing

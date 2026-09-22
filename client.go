@@ -52,6 +52,7 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+	hooks        *clientHooks
 }
 
 // ClientOpts configures a client
@@ -341,6 +342,7 @@ func (c *Client) run() {
 	err := c.receiveLoop()
 	c.Close()
 	c.cleanupStreams(err)
+	c.hooks.loopDone()
 
 	c.userCloseFunc()
 	close(c.userCloseWaitCh)
@@ -369,6 +371,7 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				c.hooks.orphan(sid, msg.header.Type)
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
@@ -376,8 +379,20 @@ func (c *Client) receiveLoop() error {
 			if err != nil {
 				s.closeWithError(err)
 			} else {
-				if err := s.receive(c.ctx, msg); err != nil {
-					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+				// A non-blocking delivery attempt that cannot proceed
+				// means the stream's recv buffer is full; signal tests
+				// that the receive loop is about to wait for drain.
+				select {
+				case s.recv <- msg:
+					c.hooks.delivered(sid, msg.header.Type, msg.header.Flags, true)
+				default:
+					c.hooks.blocked(sid)
+					if err := s.receive(c.ctx, msg); err != nil {
+						log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+						c.hooks.delivered(sid, msg.header.Type, msg.header.Flags, false)
+					} else {
+						c.hooks.delivered(sid, msg.header.Type, msg.header.Flags, true)
+					}
 				}
 			}
 		}
@@ -420,6 +435,7 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		s = newStream(c.nextStreamID, c, recvBuf)
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
+		c.hooks.created(s.id)
 
 		return nil
 	}(); err != nil {
@@ -436,6 +452,7 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 func (c *Client) deleteStream(s *stream) {
 	c.streamLock.Lock()
 	delete(c.streams, s.id)
+	c.hooks.deleted(s.id)
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
 }
@@ -454,6 +471,7 @@ func (c *Client) cleanupStreams(err error) {
 	for sid, s := range c.streams {
 		s.closeWithError(err)
 		delete(c.streams, sid)
+		c.hooks.deleted(sid)
 	}
 }
 

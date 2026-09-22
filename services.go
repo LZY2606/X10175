@@ -102,7 +102,7 @@ func (s *serviceSet) streamCall(ctx context.Context, stream StreamHandler, info 
 	return
 }
 
-func (s *serviceSet) handle(ctx context.Context, req *Request, respond func(*status.Status, []byte, bool, bool) error) (*streamHandler, error) {
+func (s *serviceSet) handle(ctx context.Context, req *Request, respond func(*status.Status, []byte, bool, bool) error, hooks *serverHooks, reqStreamID uint32) (*streamHandler, error) {
 	srv, ok := s.services[req.Service]
 	if !ok {
 		return nil, status.Errorf(codes.Unimplemented, "service %v", req.Service)
@@ -138,7 +138,9 @@ func (s *serviceSet) handle(ctx context.Context, req *Request, respond func(*sta
 			respond: respond,
 			recv:    make(chan Unmarshaler, recvBuf),
 			info:    info,
+			hooks:   hooks,
 		}
+		sh.id = reqStreamID
 		go func() {
 			defer cancel()
 			p, st := s.streamCall(ctx, stream.Handler, info, sh)
@@ -174,6 +176,8 @@ type streamHandler struct {
 	respond func(*status.Status, []byte, bool, bool) error
 	recv    chan Unmarshaler
 	info    *StreamServerInfo
+	id      uint32
+	hooks   *serverHooks
 
 	remoteClosed bool
 	localClosed  bool
@@ -198,6 +202,7 @@ func (s *streamHandler) data(unmarshal Unmarshaler) error {
 	default:
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise return an error.
+		s.hooks.blockedData(s.id)
 		select {
 		case s.recv <- unmarshal:
 			return nil
