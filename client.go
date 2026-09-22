@@ -44,6 +44,10 @@ type Client struct {
 	nextStreamID streamID
 	sendLock     sync.Mutex
 
+	// streamBackpressure is a package-private observability hook, forwarded
+	// to streams created by this client. Nil in production.
+	streamBackpressure chan<- struct{}
+
 	ctx    context.Context
 	closed func()
 
@@ -417,7 +421,7 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		default:
 		}
 
-		s = newStream(c.nextStreamID, c, recvBuf)
+		s = newStream(c.nextStreamID, c, recvBuf, c.streamBackpressure)
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
 

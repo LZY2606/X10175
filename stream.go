@@ -37,14 +37,21 @@ type stream struct {
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
+
+	// backpressureWait, when non-nil, is signaled (non-blocking) exactly
+	// when a frame has entered the slow path of receive() because the
+	// recv buffer is full. It is a package-private observability hook used
+	// by tests to synchronize on backpressure without timing assumptions.
+	backpressureWait chan<- struct{}
 }
 
-func newStream(id streamID, send sender, recvBuf int) *stream {
+func newStream(id streamID, send sender, recvBuf int, backpressureWait chan<- struct{}) *stream {
 	return &stream{
-		id:        id,
-		sender:    send,
-		recv:      make(chan *streamMessage, recvBuf),
-		recvClose: make(chan struct{}),
+		id:               id,
+		sender:           send,
+		recv:             make(chan *streamMessage, recvBuf),
+		recvClose:        make(chan struct{}),
+		backpressureWait: backpressureWait,
 	}
 }
 
@@ -85,6 +92,12 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 	default:
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise close the stream.
+		if s.backpressureWait != nil {
+			select {
+			case s.backpressureWait <- struct{}{}:
+			default:
+			}
+		}
 		select {
 		case <-s.recvClose:
 			return s.recvErr
