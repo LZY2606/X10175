@@ -304,8 +304,26 @@ type serverConn struct {
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
 
+	// streams tracks the active stream handlers for this connection. It is
+	// owned by run but exposed through streamCount as a package-private
+	// test hook for observing stream cleanup timing.
+	streams sync.Map
+
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+}
+
+// streamCount reports the number of streams currently registered on the
+// connection. It is a package-private observation hook for tests; it does
+// not mutate or synchronize any production state beyond the sync.Map's own
+// guarantees.
+func (c *serverConn) streamCount() int {
+	n := 0
+	c.streams.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -343,7 +361,7 @@ func (c *serverConn) run(sctx context.Context) {
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
 		done                   = make(chan struct{})
-		streams                = sync.Map{}
+		streams                = &c.streams
 		active       int32
 		lastStreamID uint32
 	)
