@@ -52,6 +52,11 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	// Package-private test hooks. Nil in production use; callers must
+	// treat them as fire-and-forget observations.
+	onStreamDelivered func(id streamID, depth int)
+	onReceiveLoopDone func(err error)
 }
 
 // ClientOpts configures a client
@@ -339,6 +344,9 @@ func (c *Client) UserOnCloseWait(ctx context.Context) error {
 
 func (c *Client) run() {
 	err := c.receiveLoop()
+	if c.onReceiveLoopDone != nil {
+		c.onReceiveLoopDone(err)
+	}
 	c.Close()
 	c.cleanupStreams(err)
 
@@ -418,6 +426,11 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		}
 
 		s = newStream(c.nextStreamID, c, recvBuf)
+		s.onDelivered = func(depth int) {
+			if c.onStreamDelivered != nil {
+				c.onStreamDelivered(s.id, depth)
+			}
+		}
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
 

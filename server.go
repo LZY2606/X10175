@@ -306,6 +306,16 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// Package-private test hooks. Nil in production use; they only
+	// observe state and must never influence the connection's decisions.
+	onStreamAdd      func(id uint32)
+	onStreamDel      func(id uint32)
+	onFinalFrameSent func(id uint32)
+	onDataQueued     func(id uint32, depth int)
+	onRecvErr        func(err error)
+	onHandlerDone    func(id uint32)
+	onConnDone       func()
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -352,6 +362,11 @@ func (c *serverConn) run(sctx context.Context) {
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer func() {
+		if c.onConnDone != nil {
+			c.onConnDone()
+		}
+	}()
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -384,6 +399,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 			mh, p, err := ch.recv()
 			if err != nil {
+				if c.onRecvErr != nil {
+					c.onRecvErr(err)
+				}
 				status, ok := status.FromError(err)
 				if !ok {
 					recvErr <- err
@@ -429,6 +447,9 @@ func (c *serverConn) run(sctx context.Context) {
 						}
 						continue
 					}
+					if c.onDataQueued != nil {
+						c.onDataQueued(mh.StreamID, len(sh.recv))
+					}
 				}
 
 				if mh.Flags&flagRemoteClosed == flagRemoteClosed {
@@ -464,6 +485,7 @@ func (c *serverConn) run(sctx context.Context) {
 				ch.putmbuf(p)
 
 				id := mh.StreamID
+				var handlerResultOnce sync.Once
 				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
 					select {
 					case responses <- response{
@@ -475,6 +497,13 @@ func (c *serverConn) run(sctx context.Context) {
 					}:
 					case <-done:
 						return ErrClosed
+					}
+					if closeStream {
+						handlerResultOnce.Do(func() {
+							if c.onHandlerDone != nil {
+								c.onHandlerDone(id)
+							}
+						})
 					}
 					return nil
 				}
@@ -488,6 +517,9 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 
 				streams.Store(id, sh)
+				if c.onStreamAdd != nil {
+					c.onStreamAdd(id)
+				}
 				atomic.AddInt32(&active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
@@ -544,10 +576,16 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			if response.closeStream {
+				if c.onFinalFrameSent != nil {
+					c.onFinalFrameSent(response.id)
+				}
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
+				if c.onStreamDel != nil {
+					c.onStreamDel(response.id)
+				}
 				atomic.AddInt32(&active, -1)
 			}
 		case err := <-recvErr:

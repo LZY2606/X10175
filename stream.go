@@ -37,6 +37,11 @@ type stream struct {
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
+
+	// onDelivered is a package-private test hook invoked after a message
+	// has been handed to the recv channel. It is nil outside of tests and
+	// must not be used to alter the delivery path.
+	onDelivered func(depth int)
 }
 
 func newStream(id streamID, send sender, recvBuf int) *stream {
@@ -60,6 +65,14 @@ func (s *stream) closeWithError(err error) error {
 	return nil
 }
 
+// delivered fires the onDelivered test hook. Callers must hold no
+// stream lock beyond the hook itself.
+func (s *stream) delivered() {
+	if s.onDelivered != nil {
+		s.onDelivered(len(s.recv))
+	}
+}
+
 func (s *stream) send(mt messageType, flags uint8, b []byte) error {
 	return s.sender.send(uint32(s.id), mt, flags, b)
 }
@@ -79,6 +92,7 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 	case <-s.recvClose:
 		return s.recvErr
 	case s.recv <- msg:
+		s.delivered()
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -89,6 +103,7 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 		case <-s.recvClose:
 			return s.recvErr
 		case s.recv <- msg:
+			s.delivered()
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
