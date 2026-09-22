@@ -37,6 +37,18 @@ type stream struct {
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
+
+	// onPark, when non-nil, is invoked exactly once when the receive loop
+	// enters the bounded backpressure wait because this stream's recv buffer
+	// is full. It is a package-private synchronization hook used by the
+	// state-machine tests; production code never sets it.
+	parkOnce sync.Once
+	onPark   func()
+
+	// afterDeliver, when non-nil, is invoked after a message is enqueued
+	// into recv. Package-private test instrumentation; production code
+	// never sets it.
+	afterDeliver func(*streamMessage)
 }
 
 func newStream(id streamID, send sender, recvBuf int) *stream {
@@ -79,16 +91,27 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 	case <-s.recvClose:
 		return s.recvErr
 	case s.recv <- msg:
+		if s.afterDeliver != nil {
+			s.afterDeliver(msg)
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise close the stream.
+		s.parkOnce.Do(func() {
+			if s.onPark != nil {
+				s.onPark()
+			}
+		})
 		select {
 		case <-s.recvClose:
 			return s.recvErr
 		case s.recv <- msg:
+			if s.afterDeliver != nil {
+				s.afterDeliver(msg)
+			}
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()

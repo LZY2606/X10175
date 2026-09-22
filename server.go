@@ -306,6 +306,28 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// Per-connection stream bookkeeping. These are owned exclusively by
+	// run() and its receive goroutine; they live on the connection so the
+	// stream lifecycle stays attached to the connection object (which also
+	// makes it observable to package-private tests).
+	ch           *channel
+	streams      sync.Map // streamID -> *streamHandler
+	active       atomic.Int32
+	lastStreamID uint32
+	done         chan struct{} // closed when run() is finishing
+
+	// recvDone is closed once the receive goroutine has exited. It is
+	// package-private test instrumentation: tests may pre-create the
+	// channel before run() starts to observe exactly when the receive
+	// goroutine terminates. Production code leaves it nil.
+	recvDone chan struct{}
+
+	// onStreamRegistered, when non-nil, is invoked with each new
+	// streamHandler right after it is stored in the stream set. It is
+	// package-private test instrumentation used to attach backpressure
+	// hooks without polling; production code leaves it nil.
+	onStreamRegistered func(uint32, *streamHandler)
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -337,20 +359,18 @@ func (c *serverConn) run(sctx context.Context) {
 	)
 
 	var (
-		ch                     = newChannel(c.conn)
-		ctx, cancel            = context.WithCancel(sctx)
-		state        connState = connStateIdle
-		responses              = make(chan response)
-		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		ctx, cancel           = context.WithCancel(sctx)
+		state       connState = connStateIdle
 	)
+
+	c.ch = newChannel(c.conn)
+	c.done = make(chan struct{})
+	responses := make(chan response)
+	recvErr := make(chan error, 1)
 
 	defer c.conn.Close()
 	defer cancel()
-	defer close(done)
+	defer close(c.done)
 	defer c.server.delConnection(c)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
@@ -366,23 +386,27 @@ func (c *serverConn) run(sctx context.Context) {
 			return true
 		case <-c.shutdown:
 			return false
-		case <-done:
+		case <-c.done:
 			return false
 		}
 	}
 
+	recvFinish := c.recvDone
 	go func(recvErr chan error) {
+		if recvFinish != nil {
+			defer close(recvFinish)
+		}
 		defer close(recvErr)
 		for {
 			select {
 			case <-c.shutdown:
 				return
-			case <-done:
+			case <-c.done:
 				return
 			default: // proceed
 			}
 
-			mh, p, err := ch.recv()
+			mh, p, err := c.ch.recv()
 			if err != nil {
 				status, ok := status.FromError(err)
 				if !ok {
@@ -408,7 +432,7 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			if mh.Type == messageTypeData {
-				i, ok := streams.Load(mh.StreamID)
+				i, ok := c.streams.Load(mh.StreamID)
 				if !ok {
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
@@ -419,7 +443,7 @@ func (c *serverConn) run(sctx context.Context) {
 				if mh.Flags&flagNoData != flagNoData {
 					unmarshal := func(obj any) error {
 						err := protoUnmarshal(p, obj)
-						ch.putmbuf(p)
+						c.ch.putmbuf(p)
 						return err
 					}
 
@@ -441,7 +465,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 				}
 			} else if mh.Type == messageTypeRequest {
-				if mh.StreamID <= lastStreamID {
+				if mh.StreamID <= c.lastStreamID {
 					// enforce odd client initiated identifiers.
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
 						return
@@ -449,19 +473,19 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 
 				}
-				lastStreamID = mh.StreamID
+				c.lastStreamID = mh.StreamID
 
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
 				var req Request
 				if err := c.server.codec.Unmarshal(p, &req); err != nil {
-					ch.putmbuf(p)
+					c.ch.putmbuf(p)
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "unmarshal request error: %v", err)) {
 						return
 					}
 					continue
 				}
-				ch.putmbuf(p)
+				c.ch.putmbuf(p)
 
 				id := mh.StreamID
 				respond := func(status *status.Status, data []byte, streaming, closeStream bool) error {
@@ -473,7 +497,7 @@ func (c *serverConn) run(sctx context.Context) {
 						closeStream: closeStream,
 						streaming:   streaming,
 					}:
-					case <-done:
+					case <-c.done:
 						return ErrClosed
 					}
 					return nil
@@ -487,8 +511,11 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 
-				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				c.streams.Store(id, sh)
+				if c.onStreamRegistered != nil {
+					c.onStreamRegistered(id, sh)
+				}
+				c.active.Add(1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -500,7 +527,7 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
-		activeN := atomic.LoadInt32(&active)
+		activeN := c.active.Load()
 		if activeN > 0 {
 			newstate = connStateActive
 			shutdown = nil
@@ -525,7 +552,7 @@ func (c *serverConn) run(sctx context.Context) {
 					return
 				}
 
-				if err := ch.send(response.id, messageTypeResponse, 0, p); err != nil {
+				if err := c.ch.send(response.id, messageTypeResponse, 0, p); err != nil {
 					log.G(ctx).WithError(err).Error("failed sending message on channel")
 					return
 				}
@@ -537,7 +564,7 @@ func (c *serverConn) run(sctx context.Context) {
 				if response.data == nil {
 					flags = flags | flagNoData
 				}
-				if err := ch.send(response.id, messageTypeData, flags, response.data); err != nil {
+				if err := c.ch.send(response.id, messageTypeData, flags, response.data); err != nil {
 					log.G(ctx).WithError(err).Error("failed sending message on channel")
 					return
 				}
@@ -547,8 +574,8 @@ func (c *serverConn) run(sctx context.Context) {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
-				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				c.streams.Delete(response.id)
+				c.active.Add(-1)
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

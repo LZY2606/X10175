@@ -41,6 +41,7 @@ type Client struct {
 
 	streamLock   sync.RWMutex
 	streams      map[streamID]*stream
+	streamCond   *sync.Cond // broadcast on streams map mutations (test instrumentation; nil-safe)
 	nextStreamID streamID
 	sendLock     sync.Mutex
 
@@ -122,6 +123,7 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
 	}
+	c.streamCond = sync.NewCond(&c.streamLock)
 
 	for _, o := range opts {
 		o(c)
@@ -420,6 +422,9 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		s = newStream(c.nextStreamID, c, recvBuf)
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
+		if c.streamCond != nil {
+			c.streamCond.Broadcast()
+		}
 
 		return nil
 	}(); err != nil {
@@ -436,6 +441,9 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 func (c *Client) deleteStream(s *stream) {
 	c.streamLock.Lock()
 	delete(c.streams, s.id)
+	if c.streamCond != nil {
+		c.streamCond.Broadcast()
+	}
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
 }
@@ -454,6 +462,9 @@ func (c *Client) cleanupStreams(err error) {
 	for sid, s := range c.streams {
 		s.closeWithError(err)
 		delete(c.streams, sid)
+	}
+	if c.streamCond != nil {
+		c.streamCond.Broadcast()
 	}
 }
 

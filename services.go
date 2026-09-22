@@ -23,6 +23,7 @@ import (
 	"io"
 	"os"
 	"path"
+	"sync"
 	"time"
 	"unsafe"
 
@@ -177,6 +178,14 @@ type streamHandler struct {
 
 	remoteClosed bool
 	localClosed  bool
+
+	// onPark, when non-nil, is invoked exactly once when the connection
+	// receive goroutine enters the bounded backpressure wait because this
+	// handler's recv buffer is full. It is a package-private
+	// synchronization hook used by the state-machine tests; production
+	// code never sets it.
+	parkOnce sync.Once
+	onPark   func()
 }
 
 func (s *streamHandler) closeSend() {
@@ -198,6 +207,11 @@ func (s *streamHandler) data(unmarshal Unmarshaler) error {
 	default:
 		// If recv channel is full, wait up to a second for an item
 		// to drain and unblock, otherwise return an error.
+		s.parkOnce.Do(func() {
+			if s.onPark != nil {
+				s.onPark()
+			}
+		})
 		select {
 		case s.recv <- unmarshal:
 			return nil
