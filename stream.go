@@ -79,6 +79,9 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 	case <-s.recvClose:
 		return s.recvErr
 	case s.recv <- msg:
+		if streamDeliverHook != nil {
+			streamDeliverHook(uint32(s.id))
+		}
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -89,6 +92,9 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 		case <-s.recvClose:
 			return s.recvErr
 		case s.recv <- msg:
+			if streamDeliverHook != nil {
+				streamDeliverHook(uint32(s.id))
+			}
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()

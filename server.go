@@ -489,6 +489,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				if serverStreamTableHook != nil {
+					serverStreamTableHook(id, true)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +552,9 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				if serverStreamTableHook != nil {
+					serverStreamTableHook(response.id, false)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

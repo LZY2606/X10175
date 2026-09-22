@@ -425,6 +425,9 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	}(); err != nil {
 		return nil, err
 	}
+	if clientStreamTableHook != nil {
+		clientStreamTableHook(uint32(s.id), true)
+	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
 		return s, filterCloseErr(err)
@@ -437,6 +440,9 @@ func (c *Client) deleteStream(s *stream) {
 	c.streamLock.Lock()
 	delete(c.streams, s.id)
 	c.streamLock.Unlock()
+	if clientStreamTableHook != nil {
+		clientStreamTableHook(uint32(s.id), false)
+	}
 	s.closeWithError(nil)
 }
 
@@ -454,6 +460,9 @@ func (c *Client) cleanupStreams(err error) {
 	for sid, s := range c.streams {
 		s.closeWithError(err)
 		delete(c.streams, sid)
+		if clientStreamTableHook != nil {
+			clientStreamTableHook(uint32(sid), false)
+		}
 	}
 }
 
