@@ -369,6 +369,7 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				testHookInactiveStream(uint32(sid))
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
@@ -378,6 +379,8 @@ func (c *Client) receiveLoop() error {
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+				} else {
+					testHookStreamDelivered(uint32(sid))
 				}
 			}
 		}
