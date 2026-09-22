@@ -41,6 +41,23 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+
+	hooks *serverConnHooks
+}
+
+// serverConnHooks contains package-private hooks used by state machine tests
+// to observe connection and stream lifecycle events. All hooks are nil in
+// production use.
+type serverConnHooks struct {
+	// streamAdded is invoked when a stream handler is registered on a
+	// connection.
+	streamAdded func(id uint32)
+	// streamRemoved is invoked when a stream is removed from a
+	// connection after its final response has been written.
+	streamRemoved func(id uint32)
+	// connDone is invoked after a connection has fully terminated and
+	// been removed from the server's connection set.
+	connDone func()
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -351,7 +368,12 @@ func (c *serverConn) run(sctx context.Context) {
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
-	defer c.server.delConnection(c)
+	defer func() {
+		c.server.delConnection(c)
+		if h := c.server.hooks; h != nil && h.connDone != nil {
+			h.connDone()
+		}
+	}()
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -489,6 +511,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				if h := c.server.hooks; h != nil && h.streamAdded != nil {
+					h.streamAdded(id)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +574,9 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				if h := c.server.hooks; h != nil && h.streamRemoved != nil {
+					h.streamRemoved(response.id)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

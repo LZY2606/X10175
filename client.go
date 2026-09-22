@@ -52,10 +52,32 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	hooks *clientHooks
 }
 
 // ClientOpts configures a client
 type ClientOpts func(c *Client)
+
+// clientHooks contains package-private hooks used by state machine tests to
+// observe the client's receive loop without altering its behavior. All hooks
+// are nil in production use.
+type clientHooks struct {
+	// received is invoked after a message has been queued to an active
+	// stream by the receive loop.
+	received func(id streamID, mt messageType)
+	// inactive is invoked when a message arrives for a stream that is no
+	// longer registered and is therefore dropped.
+	inactive func(id streamID)
+}
+
+// withClientHooks installs test hooks on the client. It is package-private
+// and must not be exposed as public API.
+func withClientHooks(h *clientHooks) ClientOpts {
+	return func(c *Client) {
+		c.hooks = h
+	}
+}
 
 // WithOnClose sets the close func whenever the client's Close() method is called
 func WithOnClose(onClose func()) ClientOpts {
@@ -369,6 +391,9 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				if h := c.hooks; h != nil && h.inactive != nil {
+					h.inactive(sid)
+				}
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
@@ -378,6 +403,8 @@ func (c *Client) receiveLoop() error {
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+				} else if h := c.hooks; h != nil && h.received != nil {
+					h.received(sid, msg.header.Type)
 				}
 			}
 		}
