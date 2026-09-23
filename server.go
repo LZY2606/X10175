@@ -288,6 +288,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		server:    s,
 		conn:      conn,
 		handshake: handshake,
+		runDone:   make(chan struct{}),
 		shutdown:  make(chan struct{}),
 	}
 	c.setState(connStateIdle)
@@ -304,8 +305,35 @@ type serverConn struct {
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
 
+	// runDone is closed when the connection's run goroutine has exited.
+	runDone chan struct{}
+
+	// Per-connection stream state. These are lifted out of run's locals so
+	// the state can be inspected without relying on scheduler timing.
+	streams      sync.Map // map[streamID]*streamHandler
+	active       int32
+	lastStreamID uint32
+
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// Test-only stream lifecycle hooks. Nil in production. These do not
+	// alter synchronization or ordering; they fire immediately after the
+	// corresponding stream map mutation has completed.
+	streamAdded   func(streamID)
+	streamRemoved func(streamID)
+}
+
+func (c *serverConn) notifyStreamAdded(id streamID) {
+	if c.streamAdded != nil {
+		c.streamAdded(id)
+	}
+}
+
+func (c *serverConn) notifyStreamRemoved(id streamID) {
+	if c.streamRemoved != nil {
+		c.streamRemoved(id)
+	}
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -342,15 +370,15 @@ func (c *serverConn) run(sctx context.Context) {
 		state        connState = connStateIdle
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
-		lastStreamID uint32
+		done                   = c.runDone
 	)
+	active := &c.active
+	streams := &c.streams
+	lastStreamID := &c.lastStreamID
 
 	defer c.conn.Close()
 	defer cancel()
-	defer close(done)
+	defer close(c.runDone)
 	defer c.server.delConnection(c)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
@@ -441,7 +469,7 @@ func (c *serverConn) run(sctx context.Context) {
 					}
 				}
 			} else if mh.Type == messageTypeRequest {
-				if mh.StreamID <= lastStreamID {
+				if mh.StreamID <= *lastStreamID {
 					// enforce odd client initiated identifiers.
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID cannot be re-used and must increment")) {
 						return
@@ -449,7 +477,7 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 
 				}
-				lastStreamID = mh.StreamID
+				*lastStreamID = mh.StreamID
 
 				// TODO: Make request type configurable
 				// Unmarshaller which takes in a byte array and returns an interface?
@@ -488,7 +516,8 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 
 				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				atomic.AddInt32(active, 1)
+				c.notifyStreamAdded(streamID(id))
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -500,7 +529,7 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
-		activeN := atomic.LoadInt32(&active)
+		activeN := atomic.LoadInt32(active)
 		if activeN > 0 {
 			newstate = connStateActive
 			shutdown = nil
@@ -548,7 +577,8 @@ func (c *serverConn) run(sctx context.Context) {
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				atomic.AddInt32(active, -1)
+				c.notifyStreamRemoved(streamID(response.id))
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
