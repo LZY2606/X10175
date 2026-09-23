@@ -289,6 +289,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +307,14 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	// streams holds the active stream handlers keyed by stream id. It is
+	// owned by run but kept on the struct so tests can observe stream
+	// registration and cleanup timing.
+	streams sync.Map
+	// done is closed when run returns, signalling that the connection
+	// goroutine has finished.
+	done chan struct{}
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -342,10 +351,9 @@ func (c *serverConn) run(sctx context.Context) {
 		state        connState = connStateIdle
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
 		active       int32
 		lastStreamID uint32
+		done                   = c.done
 	)
 
 	defer c.conn.Close()
@@ -408,7 +416,7 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			if mh.Type == messageTypeData {
-				i, ok := streams.Load(mh.StreamID)
+				i, ok := c.streams.Load(mh.StreamID)
 				if !ok {
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
@@ -487,7 +495,7 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 
-				streams.Store(id, sh)
+				c.streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
@@ -547,7 +555,7 @@ func (c *serverConn) run(sctx context.Context) {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
-				streams.Delete(response.id)
+				c.streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
 			}
 		case err := <-recvErr:
