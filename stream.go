@@ -33,18 +33,20 @@ type stream struct {
 	id     streamID
 	sender sender
 	recv   chan *streamMessage
+	ctx    context.Context
 
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
 }
 
-func newStream(id streamID, send sender, recvBuf int) *stream {
+func newStream(ctx context.Context, id streamID, send sender, recvBuf int) *stream {
 	return &stream{
 		id:        id,
 		sender:    send,
 		recv:      make(chan *streamMessage, recvBuf),
 		recvClose: make(chan struct{}),
+		ctx:       ctx,
 	}
 }
 

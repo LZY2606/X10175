@@ -52,6 +52,11 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+	testHooks   *clientTestHooks
+}
+
+type clientTestHooks struct {
+	changed chan struct{}
 }
 
 // ClientOpts configures a client
@@ -89,6 +94,21 @@ func WithChainUnaryClientInterceptor(interceptors ...UnaryClientInterceptor) Cli
 		) error {
 			return interceptors[0](ctx, req, reply, info,
 				chainUnaryInterceptors(interceptors[1:], final, info))
+		}
+	}
+}
+
+func withClientTestHooks(hooks *clientTestHooks) ClientOpts {
+	return func(c *Client) {
+		c.testHooks = hooks
+	}
+}
+
+func (c *Client) noteStreamsChanged() {
+	if c.testHooks != nil && c.testHooks.changed != nil {
+		select {
+		case c.testHooks.changed <- struct{}{}:
+		default:
 		}
 	}
 }
@@ -254,18 +274,12 @@ func (cs *clientStream) RecvMsg(m any) error {
 		return io.EOF
 	}
 
-	var msg *streamMessage
-	select {
-	case <-cs.ctx.Done():
-		return cs.ctx.Err()
-	case <-cs.s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-cs.s.recv:
-		default:
-			return cs.s.recvErr
+	msg, err := receiveStreamMessage(cs.ctx, cs.c.ctx, cs.s)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			cs.c.deleteStream(cs.s)
 		}
-	case msg = <-cs.s.recv:
+		return err
 	}
 
 	switch msg.header.Type {
@@ -376,7 +390,12 @@ func (c *Client) receiveLoop() error {
 			if err != nil {
 				s.closeWithError(err)
 			} else {
-				if err := s.receive(c.ctx, msg); err != nil {
+				if err := s.receive(s.ctx, msg); err != nil {
+					if errors.Is(err, context.Canceled) ||
+						errors.Is(err, context.DeadlineExceeded) ||
+						errors.Is(err, ErrStreamFull) {
+						c.deleteStream(s)
+					}
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
 				}
 			}
@@ -386,7 +405,7 @@ func (c *Client) receiveLoop() error {
 
 // createStream creates a new stream and registers it with the client
 // Introduce stream types for multiple or single response
-func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, error) {
+func (c *Client) createStream(ctx context.Context, flags uint8, b []byte, recvBuf int) (*stream, error) {
 	// sendLock must be held across both allocation of the stream ID and sending it across the wire.
 	// This ensures that new stream IDs sent on the wire are always increasing, which is a
 	// requirement of the TTRPC protocol.
@@ -417,9 +436,10 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 		default:
 		}
 
-		s = newStream(c.nextStreamID, c, recvBuf)
+		s = newStream(ctx, c.nextStreamID, c, recvBuf)
 		c.streams[s.id] = s
 		c.nextStreamID = c.nextStreamID + 2
+		c.noteStreamsChanged()
 
 		return nil
 	}(); err != nil {
@@ -427,6 +447,7 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
+		c.deleteStream(s)
 		return s, filterCloseErr(err)
 	}
 
@@ -438,6 +459,7 @@ func (c *Client) deleteStream(s *stream) {
 	delete(c.streams, s.id)
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
+	c.noteStreamsChanged()
 }
 
 func (c *Client) getStream(sid streamID) *stream {
@@ -455,6 +477,7 @@ func (c *Client) cleanupStreams(err error) {
 		s.closeWithError(err)
 		delete(c.streams, sid)
 	}
+	c.noteStreamsChanged()
 }
 
 // filterCloseErr rewrites EOF and EPIPE errors to ErrClosed. Use when
@@ -517,7 +540,7 @@ func (c *Client) NewStream(ctx context.Context, desc *StreamDesc, service, metho
 	} else {
 		flags = flagRemoteClosed
 	}
-	s, err := c.createStream(flags, p, streamRecvBufferSize)
+	s, err := c.createStream(ctx, flags, p, streamRecvBufferSize)
 	if err != nil {
 		return nil, err
 	}
@@ -536,26 +559,15 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 		return err
 	}
 
-	s, err := c.createStream(0, p, 1)
+	s, err := c.createStream(ctx, 0, p, 1)
 	if err != nil {
 		return err
 	}
 	defer c.deleteStream(s)
 
-	var msg *streamMessage
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-c.ctx.Done():
-		return ErrClosed
-	case <-s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-s.recv:
-		default:
-			return s.recvErr
-		}
-	case msg = <-s.recv:
+	msg, err := receiveStreamMessage(ctx, c.ctx, s)
+	if err != nil {
+		return err
 	}
 
 	if msg.header.Type == messageTypeResponse {
@@ -568,4 +580,40 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 	c.channel.putmbuf(msg.payload)
 
 	return err
+}
+
+func receiveStreamMessage(ctx, connCtx context.Context, s *stream) (*streamMessage, error) {
+	for {
+		select {
+		case msg := <-s.recv:
+			return msg, nil
+		default:
+		}
+
+		select {
+		case msg := <-s.recv:
+			return msg, nil
+		case <-ctx.Done():
+			select {
+			case msg := <-s.recv:
+				return msg, nil
+			default:
+				return nil, ctx.Err()
+			}
+		case <-connCtx.Done():
+			select {
+			case msg := <-s.recv:
+				return msg, nil
+			default:
+				return nil, ErrClosed
+			}
+		case <-s.recvClose:
+			select {
+			case msg := <-s.recv:
+				return msg, nil
+			default:
+				return nil, s.recvErr
+			}
+		}
+	}
 }

@@ -306,6 +306,16 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+	testHooks    *serverConnTestHooks
+}
+
+type serverConnTestHooks struct {
+	streams  *sync.Map
+	active   *int32
+	ready    chan struct{}
+	messages chan messageHeader
+	changed  chan struct{}
+	runDone  chan struct{}
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -348,10 +358,37 @@ func (c *serverConn) run(sctx context.Context) {
 		lastStreamID uint32
 	)
 
+	if c.testHooks != nil {
+		c.testHooks.streams = &streams
+		c.testHooks.active = &active
+		close(c.testHooks.ready)
+		defer close(c.testHooks.runDone)
+	}
+
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer func() {
+		streams.Range(func(key, _ any) bool {
+			streams.Delete(key)
+			return true
+		})
+	}()
+
+	noteMessage := func(mh messageHeader) {
+		if c.testHooks != nil && c.testHooks.messages != nil {
+			c.testHooks.messages <- mh
+		}
+	}
+	noteChanged := func() {
+		if c.testHooks != nil && c.testHooks.changed != nil {
+			select {
+			case c.testHooks.changed <- struct{}{}:
+			default:
+			}
+		}
+	}
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -383,6 +420,7 @@ func (c *serverConn) run(sctx context.Context) {
 			}
 
 			mh, p, err := ch.recv()
+			noteMessage(mh)
 			if err != nil {
 				status, ok := status.FromError(err)
 				if !ok {
@@ -489,6 +527,7 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				noteChanged()
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +588,7 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				noteChanged()
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
