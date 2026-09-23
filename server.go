@@ -289,6 +289,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -306,6 +307,10 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+}
+
+	done    chan struct{} // closed when run returns
+	streams sync.Map      // active stream handlers, keyed by stream id
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -342,15 +347,13 @@ func (c *serverConn) run(sctx context.Context) {
 		state        connState = connStateIdle
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
 		active       int32
 		lastStreamID uint32
 	)
 
 	defer c.conn.Close()
 	defer cancel()
-	defer close(done)
+	defer close(c.done)
 	defer c.server.delConnection(c)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
@@ -366,7 +369,7 @@ func (c *serverConn) run(sctx context.Context) {
 			return true
 		case <-c.shutdown:
 			return false
-		case <-done:
+		case <-c.done:
 			return false
 		}
 	}
