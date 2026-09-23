@@ -139,6 +139,9 @@ func (s *Server) Serve(ctx context.Context, l net.Listener) error {
 			conn.Close()
 			continue
 		}
+		if newConnTestHook != nil {
+			newConnTestHook(sc)
+		}
 
 		go sc.run(ctx)
 	}
@@ -297,6 +300,11 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 	}
 	return c, nil
 }
+
+// newConnTestHook, when non-nil, is invoked with each serverConn accepted
+// by Serve. It is nil in production and is only installed by in-package
+// tests to observe connection state; it must not mutate the connection.
+var newConnTestHook func(*serverConn)
 
 type serverConn struct {
 	server    *Server
