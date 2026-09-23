@@ -288,6 +288,7 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		server:    s,
 		conn:      conn,
 		handshake: handshake,
+		done:      make(chan struct{}),
 		shutdown:  make(chan struct{}),
 	}
 	c.setState(connStateIdle)
@@ -303,6 +304,15 @@ type serverConn struct {
 	conn      net.Conn
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
+
+	// streams tracks the active stream handlers on this connection, keyed by
+	// stream id. It is owned by run() but kept on the struct so that tests can
+	// observe the connection's stream table.
+	streams sync.Map
+	// active mirrors the number of entries in streams.
+	active int32
+	// done is closed when run() returns.
+	done chan struct{}
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
@@ -342,9 +352,9 @@ func (c *serverConn) run(sctx context.Context) {
 		state        connState = connStateIdle
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
-		active       int32
+		done                   = c.done
+		streams                = &c.streams
+		active                 = &c.active
 		lastStreamID uint32
 	)
 
@@ -488,7 +498,7 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 
 				streams.Store(id, sh)
-				atomic.AddInt32(&active, 1)
+				atomic.AddInt32(active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -500,7 +510,7 @@ func (c *serverConn) run(sctx context.Context) {
 			shutdown chan struct{}
 		)
 
-		activeN := atomic.LoadInt32(&active)
+		activeN := atomic.LoadInt32(active)
 		if activeN > 0 {
 			newstate = connStateActive
 			shutdown = nil
@@ -548,7 +558,7 @@ func (c *serverConn) run(sctx context.Context) {
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
-				atomic.AddInt32(&active, -1)
+				atomic.AddInt32(active, -1)
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
