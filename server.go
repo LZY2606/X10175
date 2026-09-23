@@ -41,6 +41,8 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+
+	testHooks *serverConnTestHooks
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -61,6 +63,18 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
 	}, nil
+}
+
+// newServerWithTestHooks is the test-only counterpart of NewServer: identical
+// behavior, but every accepted connection (and connections created via
+// newServerConnWithTestHooks) installs the given observation hooks.
+func newServerWithTestHooks(hooks *serverConnTestHooks, opts ...ServerOpt) (*Server, error) {
+	srv, err := NewServer(opts...)
+	if err != nil {
+		return nil, err
+	}
+	srv.testHooks = hooks
+	return srv, nil
 }
 
 // Register registers a map of methods to method handlers
@@ -289,9 +303,29 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		conn:      conn,
 		handshake: handshake,
 		shutdown:  make(chan struct{}),
+		hooks:     s.testHooks,
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
+		c.close()
+		return nil, err
+	}
+	return c, nil
+}
+
+// newServerConnWithTestHooks creates and registers a server connection outside
+// of Serve, directly over the given net.Conn, with observation hooks
+// installed. Test-only; the returned connection still runs the production
+// run() goroutine unchanged.
+func newServerConnWithTestHooks(server *Server, conn net.Conn, hooks *serverConnTestHooks) (*serverConn, error) {
+	c := &serverConn{
+		server:   server,
+		conn:     conn,
+		shutdown: make(chan struct{}),
+		hooks:    hooks,
+	}
+	c.setState(connStateIdle)
+	if err := server.addConnection(c); err != nil {
 		c.close()
 		return nil, err
 	}
@@ -306,6 +340,8 @@ type serverConn struct {
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
+
+	hooks *serverConnTestHooks
 }
 
 func (c *serverConn) getState() (connState, bool) {
@@ -352,6 +388,11 @@ func (c *serverConn) run(sctx context.Context) {
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer func() {
+		if c.hooks != nil && c.hooks.onRunDone != nil {
+			c.hooks.onRunDone()
+		}
+	}()
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -410,6 +451,9 @@ func (c *serverConn) run(sctx context.Context) {
 			if mh.Type == messageTypeData {
 				i, ok := streams.Load(mh.StreamID)
 				if !ok {
+					if c.hooks != nil && c.hooks.onInactiveStream != nil {
+						c.hooks.onInactiveStream(mh.StreamID)
+					}
 					if !sendStatus(mh.StreamID, status.Newf(codes.InvalidArgument, "StreamID is no longer active")) {
 						return
 					}
@@ -489,6 +533,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				if c.hooks != nil && c.hooks.onStreamRegistered != nil {
+					c.hooks.onStreamRegistered(id)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +596,9 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				if c.hooks != nil && c.hooks.onStreamDeleted != nil {
+					c.hooks.onStreamDeleted(response.id)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

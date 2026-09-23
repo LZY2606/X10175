@@ -52,6 +52,8 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+
+	testHooks *clientTestHooks
 }
 
 // ClientOpts configures a client
@@ -121,6 +123,37 @@ func NewClient(conn net.Conn, opts ...ClientOpts) *Client {
 		ctx:             ctx,
 		userCloseFunc:   func() {},
 		userCloseWaitCh: make(chan struct{}),
+	}
+
+	for _, o := range opts {
+		o(c)
+	}
+
+	if c.interceptor == nil {
+		c.interceptor = defaultClientInterceptor
+	}
+
+	go c.run()
+	return c
+}
+
+// newClientWithTestHooks is the test-only counterpart of NewClient: it behaves
+// identically but installs package-private observation hooks before the
+// receive goroutine starts.
+func newClientWithTestHooks(conn net.Conn, hooks *clientTestHooks, opts ...ClientOpts) *Client {
+	ctx, cancel := context.WithCancel(context.Background())
+	channel := newChannel(conn)
+	c := &Client{
+		codec:           codec{},
+		conn:            conn,
+		channel:         channel,
+		streams:         make(map[streamID]*stream),
+		nextStreamID:    1,
+		closed:          cancel,
+		ctx:             ctx,
+		userCloseFunc:   func() {},
+		userCloseWaitCh: make(chan struct{}),
+		testHooks:       hooks,
 	}
 
 	for _, o := range opts {
@@ -211,15 +244,27 @@ func (cs *clientStream) CloseSend() error {
 	if !cs.desc.StreamingClient {
 		return fmt.Errorf("%w: cannot close non-streaming client", ErrProtocol)
 	}
-	if cs.localClosed {
+	if localCloseAlreadyDone(cs.localClosed) {
 		return ErrStreamClosed
 	}
 	err := cs.s.send(messageTypeData, flagRemoteClosed|flagNoData, nil)
 	if err != nil {
 		return filterCloseErr(err)
 	}
-	cs.localClosed = true
+	cs.localClosed = markLocalClosed()
 	return nil
+}
+
+// localCloseAlreadyDone reports whether the local half is already closed.
+// It is extracted so the "send before marking closed" ordering is an
+// explicit, testable part of the contract.
+func localCloseAlreadyDone(localClosed bool) bool {
+	return localClosed
+}
+
+// markLocalClosed returns the closed state after a successful close frame.
+func markLocalClosed() bool {
+	return true
 }
 
 func (cs *clientStream) SendMsg(m any) error {
@@ -286,17 +331,21 @@ func (cs *clientStream) RecvMsg(m any) error {
 			return status.ErrorProto(resp.Status)
 		}
 
-		cs.c.deleteStream(cs.s)
-		cs.remoteClosed = true
+		if isStreamTerminalMessage(msg.header, cs.desc) {
+			cs.c.deleteStream(cs.s)
+			cs.remoteClosed = true
+		}
 
 		return nil
 	case messageTypeData:
 		if !cs.desc.StreamingServer {
-			cs.c.deleteStream(cs.s)
-			cs.remoteClosed = true
+			if isStreamTerminalMessage(msg.header, cs.desc) {
+				cs.c.deleteStream(cs.s)
+				cs.remoteClosed = true
+			}
 			return fmt.Errorf("received data from non-streaming server: %w", ErrProtocol)
 		}
-		if msg.header.Flags&flagRemoteClosed == flagRemoteClosed {
+		if isStreamTerminalMessage(msg.header, cs.desc) {
 			cs.c.deleteStream(cs.s)
 			cs.remoteClosed = true
 
@@ -314,6 +363,25 @@ func (cs *clientStream) RecvMsg(m any) error {
 	default:
 		return fmt.Errorf("unexpected %q message received: %w", msg.header.Type, ErrProtocol)
 	}
+}
+
+// isStreamTerminalMessage reports whether a frame delivered to the client is
+// the terminal frame for the stream: a response message, or a data frame that
+// carries the remote-closed flag on a streaming server. A data frame from a
+// non-streaming server is protocol-violating but also terminal. This is the
+// exact condition under which the stream must be removed from the client
+// stream set; deleting it earlier causes in-flight frames to be rejected and
+// later frames to land on an inactive stream.
+func isStreamTerminalMessage(hdr messageHeader, desc *StreamDesc) bool {
+	if hdr.Type == messageTypeResponse {
+		return true
+	}
+	if hdr.Type == messageTypeData && !desc.StreamingServer {
+		return true
+	}
+	return hdr.Type == messageTypeData &&
+		desc.StreamingServer &&
+		hdr.Flags&flagRemoteClosed == flagRemoteClosed
 }
 
 // Close closes the ttrpc connection and underlying connection
@@ -344,6 +412,9 @@ func (c *Client) run() {
 
 	c.userCloseFunc()
 	close(c.userCloseWaitCh)
+	if c.testHooks != nil && c.testHooks.onRunDone != nil {
+		c.testHooks.onRunDone()
+	}
 }
 
 func (c *Client) receiveLoop() error {
@@ -370,14 +441,23 @@ func (c *Client) receiveLoop() error {
 			s := c.getStream(sid)
 			if s == nil {
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
+				if c.testHooks != nil && c.testHooks.onDispatched != nil {
+					c.testHooks.onDispatched(sid, msg.header, dispatchInactive)
+				}
 				continue
 			}
 
 			if err != nil {
 				s.closeWithError(err)
+				if c.testHooks != nil && c.testHooks.onDispatched != nil {
+					c.testHooks.onDispatched(sid, msg.header, dispatchRecvError)
+				}
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+				}
+				if c.testHooks != nil && c.testHooks.onDispatched != nil {
+					c.testHooks.onDispatched(sid, msg.header, dispatchDelivered)
 				}
 			}
 		}
@@ -425,6 +505,9 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	}(); err != nil {
 		return nil, err
 	}
+	if c.testHooks != nil && c.testHooks.onStreamRegistered != nil {
+		c.testHooks.onStreamRegistered(s.id)
+	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
 		return s, filterCloseErr(err)
@@ -438,6 +521,9 @@ func (c *Client) deleteStream(s *stream) {
 	delete(c.streams, s.id)
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
+	if c.testHooks != nil && c.testHooks.onStreamDeleted != nil {
+		c.testHooks.onStreamDeleted(s.id)
+	}
 }
 
 func (c *Client) getStream(sid streamID) *stream {
