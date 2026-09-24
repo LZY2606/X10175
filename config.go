@@ -24,6 +24,7 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	hooks       *testHooks
 }
 
 // ServerOpt for configuring a ttrpc server

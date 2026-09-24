@@ -36,6 +36,7 @@ type Server struct {
 	config   *serverConfig
 	services *serviceSet
 	codec    codec
+	hooks    *testHooks
 
 	mu          sync.Mutex
 	listeners   map[net.Listener]struct{}
@@ -57,6 +58,7 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 	return &Server{
 		config:      config,
 		services:    newServiceSet(config.interceptor),
+		hooks:       config.hooks,
 		done:        make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
@@ -288,7 +290,10 @@ func (s *Server) newConn(conn net.Conn, handshake any) (*serverConn, error) {
 		server:    s,
 		conn:      conn,
 		handshake: handshake,
+		hooks:     s.hooks,
+		streams:   sync.Map{},
 		shutdown:  make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 	c.setState(connStateIdle)
 	if err := s.addConnection(c); err != nil {
@@ -303,6 +308,14 @@ type serverConn struct {
 	conn      net.Conn
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
+	hooks     *testHooks
+
+	// streams tracks the request handlers currently active on the
+	// connection. A stream is registered when its request is dispatched
+	// and removed exactly once when its terminal response is written.
+	streams sync.Map
+	// done is closed when the connection run loop exits.
+	done chan struct{}
 
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
@@ -342,15 +355,13 @@ func (c *serverConn) run(sctx context.Context) {
 		state        connState = connStateIdle
 		responses              = make(chan response)
 		recvErr                = make(chan error, 1)
-		done                   = make(chan struct{})
-		streams                = sync.Map{}
 		active       int32
 		lastStreamID uint32
 	)
 
 	defer c.conn.Close()
 	defer cancel()
-	defer close(done)
+	defer close(c.done)
 	defer c.server.delConnection(c)
 
 	sendStatus := func(id uint32, st *status.Status) bool {
@@ -366,7 +377,7 @@ func (c *serverConn) run(sctx context.Context) {
 			return true
 		case <-c.shutdown:
 			return false
-		case <-done:
+		case <-c.done:
 			return false
 		}
 	}
@@ -377,7 +388,7 @@ func (c *serverConn) run(sctx context.Context) {
 			select {
 			case <-c.shutdown:
 				return
-			case <-done:
+			case <-c.done:
 				return
 			default: // proceed
 			}
@@ -473,7 +484,7 @@ func (c *serverConn) run(sctx context.Context) {
 						closeStream: closeStream,
 						streaming:   streaming,
 					}:
-					case <-done:
+					case <-c.done:
 						return ErrClosed
 					}
 					return nil
@@ -487,7 +498,10 @@ func (c *serverConn) run(sctx context.Context) {
 					continue
 				}
 
-				streams.Store(id, sh)
+				c.streams.Store(id, sh)
+				if c.hooks != nil && c.hooks.serverStreamRegistered != nil {
+					c.hooks.serverStreamRegistered(id)
+				}
 				atomic.AddInt32(&active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
