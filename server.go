@@ -41,6 +41,13 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+
+	// testStreamHook, when non-nil, is invoked after a stream is added to
+	// or removed from a connection's stream table. It is package-private
+	// and only used by tests to observe the stream lifecycle
+	// deterministically. It must be set before any connection is served
+	// and never mutated afterwards.
+	testStreamHook func(added bool, id uint32)
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -489,6 +496,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				if h := c.server.testStreamHook; h != nil {
+					h(true, id)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +559,9 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				if h := c.server.testStreamHook; h != nil {
+					h(false, response.id)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
