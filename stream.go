@@ -24,6 +24,12 @@ import (
 
 type streamID uint32
 
+// streamBackpressureTimeout is how long the connection receive loop waits
+// for a consumer to drain a full stream before giving up on delivery. It
+// is a package-level constant only so individual streams can be given a
+// deterministic override in tests.
+const streamBackpressureTimeout = time.Second
+
 type streamMessage struct {
 	header  messageHeader
 	payload []byte
@@ -37,14 +43,20 @@ type stream struct {
 	closeOnce sync.Once
 	recvErr   error
 	recvClose chan struct{}
+
+	// backpressureTimeout bounds how long receive waits when the recv
+	// channel is full. Production streams always use
+	// streamBackpressureTimeout; tests may override the value.
+	backpressureTimeout time.Duration
 }
 
 func newStream(id streamID, send sender, recvBuf int) *stream {
 	return &stream{
-		id:        id,
-		sender:    send,
-		recv:      make(chan *streamMessage, recvBuf),
-		recvClose: make(chan struct{}),
+		id:                  id,
+		sender:              send,
+		recv:                make(chan *streamMessage, recvBuf),
+		recvClose:           make(chan struct{}),
+		backpressureTimeout: streamBackpressureTimeout,
 	}
 }
 
@@ -92,7 +104,7 @@ func (s *stream) receive(ctx context.Context, msg *streamMessage) error {
 			return nil
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(time.Second):
+		case <-time.After(s.backpressureTimeout):
 			s.closeWithError(ErrStreamFull)
 			return ErrStreamFull
 		}
