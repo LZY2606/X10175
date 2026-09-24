@@ -36,6 +36,7 @@ type Server struct {
 	config   *serverConfig
 	services *serviceSet
 	codec    codec
+	testHooks *serverTestHooks
 
 	mu          sync.Mutex
 	listeners   map[net.Listener]struct{}
@@ -168,6 +169,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
+		case <-s.testShutdownWake():
 		}
 	}
 
@@ -223,23 +225,31 @@ func (s *Server) closeListeners() error {
 
 func (s *Server) addConnection(c *serverConn) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	select {
 	case <-s.done:
+		s.mu.Unlock()
 		return ErrServerClosed
 	default:
 	}
 
 	s.connections[c] = struct{}{}
+	s.mu.Unlock()
+	s.testHooks.emit("conn_added", 0, nil)
 	return nil
 }
 
 func (s *Server) delConnection(c *serverConn) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	delete(s.connections, c)
+	s.mu.Unlock()
+	s.testHooks.emit("conn_deleted", 0, nil)
+}
+
+func (s *Server) testShutdownWake() <-chan struct{} {
+	if s.testHooks == nil {
+		return nil
+	}
+	return s.testHooks.shutdownWake
 }
 
 func (s *Server) countConnection() int {
