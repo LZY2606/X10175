@@ -52,6 +52,15 @@ type Client struct {
 	userCloseWaitCh chan struct{}
 
 	interceptor UnaryClientInterceptor
+	testHooks   *clientTestHooks
+}
+
+// withClientTestHooks installs package-private observation hooks used by the
+// state-machine tests. It is unexported and cannot affect production callers.
+func withClientTestHooks(hooks *clientTestHooks) ClientOpts {
+	return func(c *Client) {
+		c.testHooks = hooks
+	}
 }
 
 // ClientOpts configures a client
@@ -375,9 +384,17 @@ func (c *Client) receiveLoop() error {
 
 			if err != nil {
 				s.closeWithError(err)
+				if c.testHooks != nil && c.testHooks.messageDelivered != nil {
+					c.testHooks.messageDelivered(msg.header.StreamID, err)
+				}
 			} else {
 				if err := s.receive(c.ctx, msg); err != nil {
 					log.G(c.ctx).WithFields(log.Fields{"error": err, "stream": sid}).Error("ttrpc: failed to handle message")
+					if c.testHooks != nil && c.testHooks.messageDelivered != nil {
+						c.testHooks.messageDelivered(msg.header.StreamID, err)
+					}
+				} else if c.testHooks != nil && c.testHooks.messageDelivered != nil {
+					c.testHooks.messageDelivered(msg.header.StreamID, nil)
 				}
 			}
 		}

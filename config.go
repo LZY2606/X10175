@@ -24,6 +24,16 @@ import (
 type serverConfig struct {
 	handshaker  Handshaker
 	interceptor UnaryServerInterceptor
+	testHooks   *serverTestHooks
+}
+
+// withServerTestHooks installs package-private observation hooks used by the
+// state-machine tests. It is unexported and cannot affect production callers.
+func withServerTestHooks(hooks *serverTestHooks) ServerOpt {
+	return func(c *serverConfig) error {
+		c.testHooks = hooks
+		return nil
+	}
 }
 
 // ServerOpt for configuring a ttrpc server

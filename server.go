@@ -33,9 +33,10 @@ import (
 )
 
 type Server struct {
-	config   *serverConfig
-	services *serviceSet
-	codec    codec
+	config    *serverConfig
+	services  *serviceSet
+	codec     codec
+	testHooks *serverTestHooks
 
 	mu          sync.Mutex
 	listeners   map[net.Listener]struct{}
@@ -57,6 +58,7 @@ func NewServer(opts ...ServerOpt) (*Server, error) {
 	return &Server{
 		config:      config,
 		services:    newServiceSet(config.interceptor),
+		testHooks:   config.testHooks,
 		done:        make(chan struct{}),
 		listeners:   make(map[net.Listener]struct{}),
 		connections: make(map[*serverConn]struct{}),
@@ -352,6 +354,21 @@ func (c *serverConn) run(sctx context.Context) {
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer func() {
+		if c.server.testHooks != nil && c.server.testHooks.connDone != nil {
+			c.server.testHooks.connDone()
+		}
+	}()
+	notifyRegistered := func(id uint32) {
+		if c.server.testHooks != nil && c.server.testHooks.streamRegistered != nil {
+			c.server.testHooks.streamRegistered(id)
+		}
+	}
+	notifyDeleted := func(id uint32) {
+		if c.server.testHooks != nil && c.server.testHooks.streamDeleted != nil {
+			c.server.testHooks.streamDeleted(id)
+		}
+	}
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -489,6 +506,7 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				notifyRegistered(id)
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -549,6 +567,7 @@ func (c *serverConn) run(sctx context.Context) {
 				// is closing, the whole stream may be considered finished
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				notifyDeleted(response.id)
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this
