@@ -41,6 +41,8 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+
+	shutdownTicker shutdownTicker
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -155,7 +157,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	lnerr := s.closeListeners()
 	s.mu.Unlock()
 
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := newShutdownTicker(s.shutdownTicker, 200*time.Millisecond)
 	defer ticker.Stop()
 	for {
 		s.closeIdleConns()
@@ -167,7 +169,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-ticker.C:
+		case <-ticker.C():
 		}
 	}
 
@@ -304,9 +306,32 @@ type serverConn struct {
 	handshake any // data from handshake, not used for now
 	state     atomic.Value
 
+	onStreamAdd    func(uint32, *streamHandler, *sync.Map)
+	onStreamDelete func(uint32, *sync.Map)
+	onConnDone     func()
+
 	shutdownOnce sync.Once
 	shutdown     chan struct{} // forced shutdown, used by close
 }
+
+type shutdownTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+
+type wallClockShutdownTicker struct {
+	ticker *time.Ticker
+}
+
+func newShutdownTicker(custom shutdownTicker, d time.Duration) shutdownTicker {
+	if custom != nil {
+		return custom
+	}
+	return wallClockShutdownTicker{ticker: time.NewTicker(d)}
+}
+
+func (t wallClockShutdownTicker) C() <-chan time.Time { return t.ticker.C }
+func (t wallClockShutdownTicker) Stop()               { t.ticker.Stop() }
 
 func (c *serverConn) getState() (connState, bool) {
 	cs, ok := c.state.Load().(connState)
@@ -346,8 +371,15 @@ func (c *serverConn) run(sctx context.Context) {
 		streams                = sync.Map{}
 		active       int32
 		lastStreamID uint32
+		recvDone     = make(chan struct{})
 	)
 
+	defer func() {
+		<-recvDone
+		if c.onConnDone != nil {
+			c.onConnDone()
+		}
+	}()
 	defer c.conn.Close()
 	defer cancel()
 	defer close(done)
@@ -372,6 +404,7 @@ func (c *serverConn) run(sctx context.Context) {
 	}
 
 	go func(recvErr chan error) {
+		defer close(recvDone)
 		defer close(recvErr)
 		for {
 			select {
@@ -489,6 +522,9 @@ func (c *serverConn) run(sctx context.Context) {
 
 				streams.Store(id, sh)
 				atomic.AddInt32(&active, 1)
+				if c.onStreamAdd != nil {
+					c.onStreamAdd(id, sh, &streams)
+				}
 			}
 			// TODO: else we must ignore this for future compat. log this?
 		}
@@ -547,8 +583,12 @@ func (c *serverConn) run(sctx context.Context) {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
+				_, streamKnown := streams.Load(response.id)
 				streams.Delete(response.id)
 				atomic.AddInt32(&active, -1)
+				if c.onStreamDelete != nil && streamKnown {
+					c.onStreamDelete(response.id, &streams)
+				}
 			}
 		case err := <-recvErr:
 			// TODO(stevvooe): Not wildly clear what we should do in this

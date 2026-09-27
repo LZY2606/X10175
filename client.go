@@ -257,9 +257,12 @@ func (cs *clientStream) RecvMsg(m any) error {
 	var msg *streamMessage
 	select {
 	case <-cs.ctx.Done():
-		return cs.ctx.Err()
+		select {
+		case msg = <-cs.s.recv:
+		default:
+			return cs.ctx.Err()
+		}
 	case <-cs.s.recvClose:
-		// If recv has a pending message, process that first
 		select {
 		case msg = <-cs.s.recv:
 		default:
@@ -272,7 +275,6 @@ func (cs *clientStream) RecvMsg(m any) error {
 	case messageTypeResponse:
 		resp := &Response{}
 		err := proto.Unmarshal(msg.payload[:msg.header.Length], resp)
-		// return the payload buffer for reuse
 		cs.c.channel.putmbuf(msg.payload)
 		if err != nil {
 			return err
@@ -545,11 +547,18 @@ func (c *Client) dispatch(ctx context.Context, req *Request, resp *Response) err
 	var msg *streamMessage
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		select {
+		case msg = <-s.recv:
+		default:
+			return ctx.Err()
+		}
 	case <-c.ctx.Done():
-		return ErrClosed
+		select {
+		case msg = <-s.recv:
+		default:
+			return ErrClosed
+		}
 	case <-s.recvClose:
-		// If recv has a pending message, process that first
 		select {
 		case msg = <-s.recv:
 		default:
