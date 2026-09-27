@@ -18,6 +18,7 @@ package ttrpc
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 )
@@ -59,6 +60,46 @@ func (s *stream) closeWithError(err error) error {
 	})
 	return nil
 }
+
+func (s *stream) recvMessage(ctx context.Context) (*streamMessage, error) {
+	select {
+	case msg := <-s.recv:
+		return msg, nil
+	default:
+	}
+
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.recvClose:
+		select {
+		case msg := <-s.recv:
+			return msg, nil
+		default:
+			return nil, s.recvErr
+		}
+	case msg := <-s.recv:
+		return msg, nil
+	}
+}
+
+func (s *stream) waitForMessage(ctx context.Context) (*streamMessage, error) {
+	var msg *streamMessage
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-s.recvClose:
+		select {
+		case msg = <-s.recv:
+		default:
+			return nil, s.recvErr
+		}
+	case msg = <-s.recv:
+	}
+	return msg, nil
+}
+
+var _ = io.EOF
 
 func (s *stream) send(mt messageType, flags uint8, b []byte) error {
 	return s.sender.send(uint32(s.id), mt, flags, b)

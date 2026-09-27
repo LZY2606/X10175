@@ -51,6 +51,9 @@ type Client struct {
 	userCloseFunc   func()
 	userCloseWaitCh chan struct{}
 
+	testStreamDeleted  func(streamID uint32)
+	testInactiveStream func(streamID uint32, header messageHeader)
+
 	interceptor UnaryClientInterceptor
 }
 
@@ -254,18 +257,9 @@ func (cs *clientStream) RecvMsg(m any) error {
 		return io.EOF
 	}
 
-	var msg *streamMessage
-	select {
-	case <-cs.ctx.Done():
-		return cs.ctx.Err()
-	case <-cs.s.recvClose:
-		// If recv has a pending message, process that first
-		select {
-		case msg = <-cs.s.recv:
-		default:
-			return cs.s.recvErr
-		}
-	case msg = <-cs.s.recv:
+	msg, err := cs.s.recvMessage(cs.ctx)
+	if err != nil {
+		return err
 	}
 
 	switch msg.header.Type {
@@ -282,12 +276,12 @@ func (cs *clientStream) RecvMsg(m any) error {
 			return err
 		}
 
+		cs.c.deleteStream(cs.s)
+		cs.remoteClosed = true
+
 		if resp.Status != nil && resp.Status.Code != int32(codes.OK) {
 			return status.ErrorProto(resp.Status)
 		}
-
-		cs.c.deleteStream(cs.s)
-		cs.remoteClosed = true
 
 		return nil
 	case messageTypeData:
@@ -369,6 +363,9 @@ func (c *Client) receiveLoop() error {
 			sid := streamID(msg.header.StreamID)
 			s := c.getStream(sid)
 			if s == nil {
+				if c.testInactiveStream != nil {
+					c.testInactiveStream(uint32(sid), msg.header)
+				}
 				log.G(c.ctx).WithField("stream", sid).Error("ttrpc: received message on inactive stream")
 				continue
 			}
@@ -427,7 +424,8 @@ func (c *Client) createStream(flags uint8, b []byte, recvBuf int) (*stream, erro
 	}
 
 	if err := c.channel.send(uint32(s.id), messageTypeRequest, flags, b); err != nil {
-		return s, filterCloseErr(err)
+		c.deleteStream(s)
+		return nil, filterCloseErr(err)
 	}
 
 	return s, nil
@@ -438,6 +436,9 @@ func (c *Client) deleteStream(s *stream) {
 	delete(c.streams, s.id)
 	c.streamLock.Unlock()
 	s.closeWithError(nil)
+	if c.testStreamDeleted != nil {
+		c.testStreamDeleted(uint32(s.id))
+	}
 }
 
 func (c *Client) getStream(sid streamID) *stream {
@@ -449,11 +450,19 @@ func (c *Client) getStream(sid streamID) *stream {
 
 func (c *Client) cleanupStreams(err error) {
 	c.streamLock.Lock()
-	defer c.streamLock.Unlock()
 
+	var deleted []streamID
 	for sid, s := range c.streams {
 		s.closeWithError(err)
 		delete(c.streams, sid)
+		deleted = append(deleted, sid)
+	}
+	c.streamLock.Unlock()
+
+	if c.testStreamDeleted != nil {
+		for _, sid := range deleted {
+			c.testStreamDeleted(uint32(sid))
+		}
 	}
 }
 
