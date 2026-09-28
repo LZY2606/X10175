@@ -41,6 +41,53 @@ type Server struct {
 	listeners   map[net.Listener]struct{}
 	connections map[*serverConn]struct{} // all connections to current state
 	done        chan struct{}            // marks point at which we stop serving requests
+
+	// testHooks holds optional package-private observability hooks used by
+	// tests. It is nil for production servers; the hook points only report
+	// state transitions already performed under the existing locks, so they
+	// do not alter synchronization or error handling.
+	testHooks *streamTestHooks
+}
+
+// streamTestEventKind identifies a server-side stream table event emitted
+// for deterministic state machine tests.
+type streamTestEventKind uint8
+
+const (
+	streamTestEventStored streamTestEventKind = iota + 1
+	streamTestEventDeleted
+	streamTestEventConnRunExit
+)
+
+// streamTestEvent records one observable server-side transition.
+type streamTestEvent struct {
+	kind streamTestEventKind
+	id   uint32
+}
+
+// streamTestHooks is the package-private observability surface used by the
+// replayable streaming state machine tests. Hooks fire synchronously at the
+// exact point a state transition becomes visible to other goroutines.
+type streamTestHooks struct {
+	onEvent func(streamTestEvent)
+}
+
+func (h *streamTestHooks) emit(ev streamTestEvent) {
+	if h == nil || h.onEvent == nil {
+		return
+	}
+	h.onEvent(ev)
+}
+
+// newServerWithTestHooks constructs a server identical to NewServer but with
+// the given package-private observability hooks installed.
+func newServerWithTestHooks(hooks *streamTestHooks, opts ...ServerOpt) (*Server, error) {
+	s, err := NewServer(opts...)
+	if err != nil {
+		return nil, err
+	}
+	s.testHooks = hooks
+	return s, nil
 }
 
 func NewServer(opts ...ServerOpt) (*Server, error) {
@@ -352,6 +399,7 @@ func (c *serverConn) run(sctx context.Context) {
 	defer cancel()
 	defer close(done)
 	defer c.server.delConnection(c)
+	defer c.server.testHooks.emit(streamTestEvent{kind: streamTestEventConnRunExit})
 
 	sendStatus := func(id uint32, st *status.Status) bool {
 		select {
@@ -488,6 +536,7 @@ func (c *serverConn) run(sctx context.Context) {
 				}
 
 				streams.Store(id, sh)
+				c.server.testHooks.emit(streamTestEvent{kind: streamTestEventStored, id: id})
 				atomic.AddInt32(&active, 1)
 			}
 			// TODO: else we must ignore this for future compat. log this?
@@ -547,7 +596,9 @@ func (c *serverConn) run(sctx context.Context) {
 				// The ttrpc protocol currently does not support the case where
 				// the server is localClosed but not remoteClosed. Once the server
 				// is closing, the whole stream may be considered finished
-				streams.Delete(response.id)
+				if _, loaded := streams.LoadAndDelete(response.id); loaded {
+					c.server.testHooks.emit(streamTestEvent{kind: streamTestEventDeleted, id: response.id})
+				}
 				atomic.AddInt32(&active, -1)
 			}
 		case err := <-recvErr:
